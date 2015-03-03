@@ -9,10 +9,10 @@
 
 Pod::Spec.new do |s|
   s.name             = "IVYTraceroute"
-  s.version          = "0.1.0"
+  s.version          = "1.0.0"
   s.summary          = "A simple UDP based traceroute implemention for iOS."
   s.description      = <<-DESC
-                       implement traceroute based UDP inspired by [kris92](https://github.com/kris92), but convert to
+                       implement traceroute based UDP inspired by [kris92](https://github.com/kris92) and Apple's implemention by DTS, but convert to
                        modern objc syntax.
                        DESC
   s.homepage         = "https://github.com/ivoryxiong/IVYTraceroute"
