@@ -2,8 +2,8 @@
 //  IVYTraceroute.m
 //  Pods
 //
-//  Created by ivoryxiong on 14/10/27.
-//
+//  Created by CocoaPods on 14/10/27.
+//  Copyright (c) 2014 ivoryxiong. All rights reserved.
 //
 
 #import "IVYTraceroute.h"
@@ -12,6 +12,50 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+
+#pragma mark - ICMP On-The-Wire Format
+static uint16_t in_cksum(const void *buffer, size_t bufferLen) {
+    // This is the standard BSD checksum code, modified to use modern types.
+    size_t bytesLeft;
+    int32_t sum;
+    const uint16_t *cursor;
+
+    union {
+        uint16_t us;
+        uint8_t uc[2];
+    } last;
+    uint16_t answer;
+
+    bytesLeft = bufferLen;
+    sum = 0;
+    cursor = buffer;
+
+    /*
+     * Our algorithm is simple, using a 32 bit accumulator (sum), we add
+     * sequential 16 bit words to it, and at the end, fold back all the
+     * carry bits from the top 16 bits into the lower 16 bits.
+     */
+    while (bytesLeft > 1) {
+        sum += *cursor;
+        cursor += 1;
+        bytesLeft -= 2;
+    }
+
+    /* mop up an odd byte, if necessary */
+    if (bytesLeft == 1) {
+        last.uc[0] = *(const uint8_t *)cursor;
+        last.uc[1] = 0;
+        sum += last.us;
+    }
+
+    /* add back carry outs from top 16 bits to low 16 bits */
+    sum = (sum >> 16) + (sum & 0xffff);         /* add hi 16 to low 16 */
+    sum += (sum >> 16);                         /* add carry */
+    answer = (uint16_t) ~sum;       /* truncate to 16 bits */
+
+    return answer;
+}
 
 @interface IVYTraceroute ()
 @property (nonatomic, assign) int udpPort;
@@ -22,38 +66,39 @@
 
 @property (nonatomic, copy) NSString *runningSyn;
 @property (nonatomic, strong) NSMutableArray *hops;
+@property (nonatomic, assign) NSInteger identifier;
+@property (nonatomic, assign) NSInteger nextSequenceNumber;
 
 @property (nonatomic, copy) IVYTracerouteHandler handler;
 @property (nonatomic, copy) IVYTracerouteProcessHandler processHandler;
 @end
 
-static IVYTraceroute *_shareInstance = nil;
 
 @implementation IVYTraceroute
 + (instancetype)sharedTraceroute {
-    if (!_shareInstance) {
-        dispatch_once_t token;
-        dispatch_once(&token, ^{
-            _shareInstance = [[IVYTraceroute alloc] init];
-        });
-    }
+    static IVYTraceroute *_shareInstance = nil;
+    static dispatch_once_t oncePredicate;
+
+    dispatch_once(&oncePredicate, ^{
+        _shareInstance = [[IVYTraceroute alloc] init];
+    });
 
     return _shareInstance;
 }
 
 + (instancetype)sharedTracerouteWithMaxTTL:(int)ttl timeout:(NSTimeInterval)timeout maxAttempts:(int)attempts port:(int)port {
-    if (!_shareInstance) {
-        dispatch_once_t token;
-        dispatch_once(&token, ^{
-            _shareInstance = [[IVYTraceroute alloc] initWithMaxTTL:ttl timeout:timeout maxAttempts:attempts port:port];
-        });
-    }
+    static IVYTraceroute *_shareInstance = nil;
+    static dispatch_once_t oncePredicate;
+
+    dispatch_once(&oncePredicate, ^{
+        _shareInstance = [[IVYTraceroute alloc] initWithMaxTTL:ttl timeout:timeout maxAttempts:attempts port:port];
+    });
 
     return _shareInstance;
 }
 
 - (instancetype)init {
-    return [self initWithMaxTTL:IVY_TRACEROUTE_MAX_TTL timeout:IVY_TRACEROUTE_TIMEOUT maxAttempts:IVY_TRACEROUTE_ATTEMPTS port:IVY_TRACEROUTE_PORT];
+    return [self initWithMaxTTL:kIVYTraceRouteMaxTTL timeout:kIVYTraceRouteTimeout maxAttempts:kIVYTraceRouteMaxAttempts port:kIVYTraceRoutePort];
 }
 
 - (instancetype)initWithMaxTTL:(int)ttl timeout:(int)timeout maxAttempts:(int)attempts port:(int)port {
@@ -67,6 +112,12 @@ static IVYTraceroute *_shareInstance = nil;
     }
 
     return self;
+}
+
+- (void)stopTrace {
+    @synchronized(_runningSyn) {
+        self.running = false;
+    }
 }
 
 - (void)tracerouteToHost:(NSString *)host process:(IVYTracerouteProcessHandler)processHandler handler:(IVYTracerouteHandler)handler {
@@ -92,7 +143,7 @@ static IVYTraceroute *_shareInstance = nil;
         return;
     }
 
-    if ((send_sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+    if ((send_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)) < 0) {
         self.handler(false, nil);
         return;
     }
@@ -106,11 +157,15 @@ static IVYTraceroute *_shareInstance = nil;
     tv.tv_sec = self.readTimeout;
     tv.tv_usec = 0;
     setsockopt(recv_sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(struct timeval));
-    char *cmsg = "GET / HTTP/1.1\r\n\r\n";
-    socklen_t n = sizeof(fromAddr);
-    char buf[100];
+    socklen_t addrLen = sizeof(fromAddr);
+    void *buffer = NULL;
 
     int ttl = 1;
+    NSData *packet = nil;
+    const struct IPHeader *ipPtr;
+    const ICMPHeader *icmpPtr;
+    self.identifier = 0;
+    self.nextSequenceNumber = 0;
 
     while (ttl <= self.maxTTL) {
         bool icmp = false;
@@ -122,27 +177,50 @@ static IVYTraceroute *_shareInstance = nil;
         }
 
         for (int try = 0; try < self.maxAttempts; try++) {
-            NSTimeInterval startTime = [[NSDate date] timeIntervalSince1970];
+            NSTimeInterval begTime = [[NSDate date] timeIntervalSince1970];
+            packet = [self packEchoPacket];
 
-            if (sendto(send_sock, cmsg, sizeof(cmsg), 0, (struct sockaddr *)&destination, sizeof(destination)) != sizeof(cmsg) ) {
-                NSLog(@"WARN in send to...\n@");
+            if (sendto(send_sock, [packet bytes], [packet length], 0, (struct sockaddr *)&destination, sizeof(destination)) != [packet length]) {
+                NSLog(@"WARN in send to...\n");
+                continue;
             }
 
-            long res = 0;
+            enum { kBufferSize = 65535 };
+            // 65535 is the maximum IP packet size, which seems like a reasonable bound
+            // here (plus it's what <x-man-page://8/ping> uses).
+            buffer = malloc(kBufferSize);
 
-            if ( (res = recvfrom(recv_sock, buf, 100, 0, (struct sockaddr *)&fromAddr, &n)) < 0l) {
-                NSLog(@"WARN [%d/%d] %s; recvfrom returned %ld\n", try, self.maxAttempts, strerror(errno), res);
-            } else {
-                NSTimeInterval elapsedTime = [[NSDate date] timeIntervalSince1970] - startTime;
-                char display[16] = {0};
-                icmp = true;
+            ssize_t bytesRead = recvfrom(recv_sock, buffer, kBufferSize, 0, (struct sockaddr *)&fromAddr, &addrLen);
 
-                inet_ntop(AF_INET, &fromAddr.sin_addr.s_addr, display, sizeof(display));
-                NSString *hostAddress = [NSString stringWithFormat:@"%s", display];
-                NSString *hostName = [self hostnameForAddress:hostAddress];
+            if (bytesRead > 0) {
+                NSMutableData *packet = [NSMutableData dataWithBytes:buffer length:(NSUInteger)bytesRead];
 
-                routeHop = [[IVYHop alloc] initWithHostName:hostName hostAddress:hostAddress ttl:ttl elapsedTime:elapsedTime];
-                break;
+                icmpPtr = [[self class] icmpInPacket:packet];
+
+                if (icmpPtr) {
+                    NSLog(@"#%u ICMP type=%u, code=%u, identifier=%u", (unsigned int)OSSwapBigToHostInt16(icmpPtr->sequenceNumber), (unsigned int)icmpPtr->type, (unsigned int)icmpPtr->code, (unsigned int)OSSwapBigToHostInt16(icmpPtr->identifier) );
+
+                    ipPtr = (const IPHeader *)[packet bytes];
+                    NSTimeInterval elapsedTime = [[NSDate date] timeIntervalSince1970] - begTime;
+                    routeHop = [[IVYHop alloc] initWithHostAddress:[NSString stringWithFormat:@"%u.%u.%u.%u", ipPtr->sourceAddress[0], ipPtr->sourceAddress[1], ipPtr->sourceAddress[2], ipPtr->sourceAddress[3] ] ttl:ttl elapsedTime:elapsedTime];
+                    if (routeHop) {
+                        [self.hops addObject:routeHop];
+                        self.processHandler(routeHop, [self.hops copy]);
+                    }
+
+                    icmp = true;
+                    if (((unsigned int)icmpPtr->type) == kICMPTypeDestinationUnreachable
+                        || ((unsigned int)icmpPtr->type) == kICMPTypeEchoReply) {
+                        ttl = self.maxTTL;
+                        free(buffer);
+                        buffer = NULL;
+                        break;
+                    }
+                }
+            }
+
+            if (buffer != NULL) {
+                free(buffer);
             }
 
             @synchronized(_runningSyn) {
@@ -155,65 +233,85 @@ static IVYTraceroute *_shareInstance = nil;
         }
 
         if (!icmp) {
-            routeHop = [[IVYHop alloc] initWithHostName:@"*" hostAddress:@"*" ttl:ttl elapsedTime:0];
-        }
-
-        if (routeHop) {
-            [self.hops addObject:routeHop];
-            self.processHandler(routeHop, [self.hops copy]);
+            routeHop = [[IVYHop alloc] initWithHostAddress:@"*" ttl:ttl elapsedTime:0];
+            if (routeHop) {
+                [self.hops addObject:routeHop];
+                self.processHandler(routeHop, [self.hops copy]);
+            }
         }
 
         ttl++;
     }
 
     self.running = false;
-
     self.handler(YES, [self.hops copy]);
 }
 
-- (void)stopTrace {
-    @synchronized(_runningSyn) {
-        self.running = false;
-    }
+- (NSMutableData *)packEchoPacket {
+    ICMPHeader *icmpPtr;
+
+    NSData *payload = [[NSString stringWithFormat:@"%0.06f", [[NSDate date] timeIntervalSince1970] ] dataUsingEncoding:NSASCIIStringEncoding];
+    NSMutableData *packet = [NSMutableData dataWithLength:sizeof(*icmpPtr) + [payload length]];
+
+    icmpPtr = [packet mutableBytes];
+    icmpPtr->type = kICMPTypeEchoRequest;
+    icmpPtr->code = 0;
+    icmpPtr->checksum = 0;
+    icmpPtr->identifier     = OSSwapHostToBigInt16(self.identifier);
+    icmpPtr->sequenceNumber = OSSwapHostToBigInt16(self.nextSequenceNumber);
+    memcpy(&icmpPtr[1], [payload bytes], [payload length]);
+
+    // The IP checksum returns a 16-bit number that's already in correct byte order
+    // (due to wacky 1's complement maths), so we just put it into the packet as a
+    // 16-bit unit.
+    icmpPtr->checksum = in_cksum([packet bytes], [packet length]);
+
+    self.nextSequenceNumber += 1;
+
+    return packet;
 }
 
-#pragma marks - network utils
-- (NSString *)hostnameForAddress:(NSString *)address {
-    NSArray *hostnames = [self hostnamesForAddress:address];
-    if ([hostnames count] > 0)
-        return [hostnames objectAtIndex:0];
-    else
-        return nil;
+#pragma mark - utils
++ (NSUInteger)icmpHeaderOffsetInPacket:(NSData *)packet {
+    NSUInteger result;
+    const struct IPHeader *ipPtr;
+    size_t ipHeaderLength;
+
+    result = NSNotFound;
+
+    if ([packet length] >= (sizeof(IPHeader) + sizeof(ICMPHeader))) {
+        ipPtr = (const IPHeader *)[packet bytes];
+        assert((ipPtr->versionAndHeaderLength & 0xF0) == 0x40);     // IPv4
+        assert(ipPtr->protocol == 1);                               // ICMP
+        ipHeaderLength = (ipPtr->versionAndHeaderLength & 0x0F) * sizeof(uint32_t);
+
+        if ([packet length] >= (ipHeaderLength + sizeof(ICMPHeader))) {
+            result = ipHeaderLength;
+        }
+    }
+
+    return result;
 }
 
-- (NSArray *)hostnamesForAddress:(NSString *)address {
-    // Get the host reference for the given address.
-    struct addrinfo      hints;
-    struct addrinfo      *result = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_flags    = AI_NUMERICHOST;
-    hints.ai_family   = PF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = 0;
-    int errorStatus = getaddrinfo([address cStringUsingEncoding:NSASCIIStringEncoding], NULL, &hints, &result);
-    if (errorStatus != 0) return nil;
-    CFDataRef addressRef = CFDataCreate(NULL, (UInt8 *)result->ai_addr, result->ai_addrlen);
-    if (addressRef == nil) return nil;
-    freeaddrinfo(result);
-    CFHostRef hostRef = CFHostCreateWithAddress(kCFAllocatorDefault, addressRef);
-    if (hostRef == nil) return nil;
-    CFRelease(addressRef);
-    BOOL isSuccess = CFHostStartInfoResolution(hostRef, kCFHostNames, NULL);
-    if (!isSuccess) return nil;
+/**
+ *  convert packet (NSData) to ICMP struct
+ *
+ *  @param packet the packet data
+ *
+ *  @return icmp struct
+ */
++ (const struct ICMPHeader *)icmpInPacket:(NSData *)packet {
+    const struct ICMPHeader *result;
+    NSUInteger icmpHeaderOffset;
     
-    // Get the hostnames for the host reference.
-    CFArrayRef hostnamesRef = CFHostGetNames(hostRef, NULL);
-    NSMutableArray *hostnames = [NSMutableArray array];
-    for (int currentIndex = 0; currentIndex < [(__bridge NSArray *)hostnamesRef count]; currentIndex++) {
-        [hostnames addObject:[(__bridge NSArray *)hostnamesRef objectAtIndex:currentIndex]];
+    result = nil;
+    icmpHeaderOffset = [self icmpHeaderOffsetInPacket:packet];
+    
+    if (icmpHeaderOffset != NSNotFound) {
+        result = (const struct ICMPHeader *)(((const uint8_t *)[packet bytes]) + icmpHeaderOffset);
     }
     
-    return hostnames;
+    return result;
 }
 
 @end

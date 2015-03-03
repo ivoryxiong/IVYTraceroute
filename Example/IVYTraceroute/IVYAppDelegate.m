@@ -14,7 +14,7 @@
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 {
     
-    [[IVYTraceroute sharedTraceroute] tracerouteToHost:@"www.wumii.org"
+    [[IVYTraceroute sharedTraceroute] tracerouteToHost:@"www.baidu.com"
                                                process:^(IVYHop *routeHop, NSArray *hops) {
                                                    NSLog(@"===============> Get Hop %@", routeHop);
                                                }
