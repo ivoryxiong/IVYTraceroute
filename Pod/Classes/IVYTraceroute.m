@@ -130,7 +130,12 @@ static uint16_t in_cksum(const void *buffer, size_t bufferLen) {
 - (void)doTraceRoute:(NSString *)host {
     struct hostent *host_entry = gethostbyname(host.UTF8String);
     char *ip_addr;
-
+	
+	if (!host_entry) {
+		self.handler(false, nil);
+		return;
+	}
+	
     ip_addr = inet_ntoa(*((struct in_addr *)host_entry->h_addr_list[0]));
     int recv_sock;
     int send_sock;
